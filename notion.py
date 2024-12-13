@@ -1,4 +1,7 @@
 import os
+import re
+import time
+import json
 import requests
 import pandas as pd
 from itertools import chain
@@ -29,6 +32,24 @@ class Notion(object):
             "rollup": lambda x: self.find_rollup(x),
             "formula": lambda x: self.find_formula(x)
         }
+        self.mutator = {
+            "number": lambda x:x ,
+            "date": lambda x: {"start": x, "end": None, "time_zone": None },
+            # "Name": {"title": [{"text": {"content": "Updated Name"}}]},
+            # "Tags": {"multi_select": [{"name": "Tag1"}, {"name": "Tag2"}]},
+            # "Select": {"select": {"name": "Option1"}},
+            # "Checkbox": {"checkbox": True},
+            # "URL": {"url": "https://example.com"},
+            # "Email": {"email": "example@example.com"},
+            # "Phone": {"phone_number": "+1234567890"},
+            # "Formula": {"formula": {"string": "Result"}},
+            # "Relation": {"relation": [{"id": "page_id_here"}]},
+            # "Rollup": {"rollup": {"number": 10, "type": "number"}},
+            # "People": {"people": [{"id": "user_id_here"}]},
+            # "Files": {"files": [{"name": "file.pdf", "type": "external", "external": {"url": "https://example.com/file.pdf"}}]},
+            # "Rich_text": {"rich_text": [{"text": {"content": "Rich text content"}}]},
+            # "Status": {"status": {"name": "In Progress"}}
+        }
 
     def find_formula(self, data):
         supported = ['number','string']
@@ -43,13 +64,56 @@ class Notion(object):
         related = [column for column in self.relations if id(self.relations[column]["from_table"]) == id(self.relations[column]["from_table"])]
         return related[0]
 
-
     def reads(self):
         url = f"https://api.notion.com/v1/databases/{self.database_id}/query"
         self.origin = requests.post(url, headers=self.headers).json()
     
-    def writes(self):
-        pass
+    def write(self, where_notion_id, set, to):
+        url = f"https://api.notion.com/v1/pages/{where_notion_id}"
+        data_type = self.schemas[set]
+        data = { "properties": { set: {data_type: self.mutator[data_type](to)} } }
+        time.sleep(0.1)
+        return requests.patch(url, headers=self.headers, data=json.dumps(data))
+
+    def writes(self, with_reference_table=True):
+        diff =  self.df.compare(self.merged_df[self.df.columns])
+        changes = []
+        if not diff.empty:
+            for col in diff.columns.levels[0]:
+                for idx in diff.index:
+                    if pd.notna(diff.at[idx, (col, 'self')]) or pd.notna(diff.at[idx, (col, 'other')]):
+                        changes.append({
+                            "notion_id": self.df.at[idx, "notion_id"],
+                            "column": col,
+                            "new_value": diff.at[idx, (col, 'self')],
+                            "old_value": diff.at[idx, (col, 'other')]
+                        })
+            for change in changes:
+                r = self.write(where_notion_id = change['notion_id'], 
+                           set = change['column'],
+                           to = change['new_value'])
+                print(f"<{r.status_code}>: notion_id {change['notion_id']}, SET {change['column']} FROM {change['old_value']} TO {change['new_value']}")
+                if r.status_code != 200:
+                    print(r.content)
+        else:
+            print(f"No update for table:{self.table_name}")
+        if with_reference_table:
+            self.write_reference_tables()
+
+    def write_reference_tables(self):
+        if self.relations:
+            for relation in self.relations:
+                if relation in list(chain(*self.mapping_relations().values())):
+                    continue
+                table = self.relations[relation]["from_table"]
+                columns = [i for i in self.merged_df.columns if re.match(rf'^{relation}\|',i)]
+                temp = self.merged_df[columns].copy()
+                temp.columns = temp.columns.str.removeprefix(f"{relation}|")
+                table.merged_df.update(temp)
+                table.writes()
+
+    def update(self, WHERE, IS, SET, TO):
+        self.df.loc[self.df[WHERE] == IS, SET] = TO
 
 
 class Table(Notion):
@@ -61,16 +125,8 @@ class Table(Notion):
         self.database_id = database_id
         self.schemas = {}
         self.relations = relations
-        if relations:
-            self.column_mapping = self.mapping_columns()
         self.reads()
         self.load_to_pandas()
-    
-    def new(self, column):
-        return f"{self.table_name}.{column}"
-    
-    def original(self, column):
-        return column.split(".")[-1]
 
     def mapping_relations(self):
         relations = {column:[] for column,type in self.schemas.items() if type == "relation"}
@@ -78,13 +134,6 @@ class Table(Notion):
             if type == "rollup":
                 relations[self.accessor[type](column)] += [column]
         return relations
-
-    def mapping_columns(self):
-        d = {}
-        for k,v in self.mapping_relations():
-            ref_df = v["from_table"]
-            d[k] = v["lookup_column"]
-        return d
     
     def load_to_pandas(self):
         df = []
@@ -110,21 +159,22 @@ class Table(Notion):
         # clean empty lines
         defaults = [i for i in self.schemas.values() if i in self.columns_with_default_value]+["notion_id"]
         self.df = self.df[~(self.df.isna().sum(axis=1)==len(self.df.columns)-len(defaults))]
-        
+        columns = []
         if self.relations:
             relations = self.mapping_relations()
             for relation,rollups in relations.items():
                 ref_df = self.relations[relation]["from_table"]
                 relation_column = self.relations[relation]["lookup_column"]
-                columns = ["notion_id",relation_column]+rollups
-                self.df = self.df.merge(ref_df.df[columns].add_prefix(f'{relation}|'), 
+                columns += [f'{relation}|{i}' for i in ["notion_id",relation_column]+rollups]
+                self.df = self.df.merge(ref_df.merged_df.add_prefix(f'{relation}|'), 
                     left_on = relation,
                     right_on= f'{relation}|notion_id',
                     how='left')
-            self.merged_df = self.df
-            columns = [i for i in self.df.columns 
-                       if i not in list(chain(*relations.items())) 
-                       and "|notion_id" not in i
-                    ]
+        self.df = self.df.set_index('notion_id', drop=False)
+        self.merged_df = self.df
+        if columns:
+            columns = [i for i in self.merged_df.columns 
+                       if "|" not in i 
+                       or (i in columns and "|notion_id" not in i)]
             self.df = self.merged_df[columns]
 
