@@ -50,6 +50,7 @@ class Notion(object):
             # "Rich_text": {"rich_text": [{"text": {"content": "Rich text content"}}]},
             # "Status": {"status": {"name": "In Progress"}}
         }
+        self.constants = ["formula"]
 
     def find_formula(self, data):
         supported = ['number','string']
@@ -71,7 +72,14 @@ class Notion(object):
     def write(self, where_notion_id, set, to):
         url = f"https://api.notion.com/v1/pages/{where_notion_id}"
         data_type = self.schemas[set]
-        data = { "properties": { set: {data_type: self.mutator[data_type](to)} } }
+        if data_type in self.constants:
+            print(f"You suppose not to modify the data_type {self.constants},\n  you are modifying {set} TO {to}. SKIPT.")
+            return
+        try:
+            data = { "properties": { set: {data_type: self.mutator[data_type](to)} } }
+        except KeyError:
+            print(f"Framework doesn't support update data_type {data_type}.\n  you are modifying {set} TO {to}. SKIPT.")
+            return
         time.sleep(0.1)
         return requests.patch(url, headers=self.headers, data=json.dumps(data))
 
@@ -92,11 +100,13 @@ class Notion(object):
                 r = self.write(where_notion_id = change['notion_id'], 
                            set = change['column'],
                            to = change['new_value'])
-                print(f"<{r.status_code}>: notion_id {change['notion_id']}, SET {change['column']} FROM {change['old_value']} TO {change['new_value']}")
-                if r.status_code != 200:
-                    print(r.content)
+                if r:
+                    print(f"<{r.status_code}>: notion_id {change['notion_id']}, SET {change['column']} FROM {change['old_value']} TO {change['new_value']}")
+                    if r.status_code != 200:
+                        print(r.content)
         else:
             print(f"No update for table:{self.table_name}")
+        self.merged_df.update(self.df)
         if with_reference_table:
             self.write_reference_tables()
 
@@ -109,7 +119,7 @@ class Notion(object):
                 columns = [i for i in self.merged_df.columns if re.match(rf'^{relation}\|',i)]
                 temp = self.merged_df[columns].copy()
                 temp.columns = temp.columns.str.removeprefix(f"{relation}|")
-                table.merged_df.update(temp)
+                table.df.update(temp)
                 table.writes()
 
     def update(self, WHERE, IS, SET, TO):
@@ -171,7 +181,7 @@ class Table(Notion):
                     right_on= f'{relation}|notion_id',
                     how='left')
         self.df = self.df.set_index('notion_id', drop=False)
-        self.merged_df = self.df
+        self.merged_df = self.df.copy()
         if columns:
             columns = [i for i in self.merged_df.columns 
                        if "|" not in i 
