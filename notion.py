@@ -47,8 +47,8 @@ class Notion(object):
             # "Rollup": {"rollup": {"number": 10, "type": "number"}},
             # "People": {"people": [{"id": "user_id_here"}]},
             # "Files": {"files": [{"name": "file.pdf", "type": "external", "external": {"url": "https://example.com/file.pdf"}}]},
-            # "Rich_text": {"rich_text": [{"text": {"content": "Rich text content"}}]},
-            # "Status": {"status": {"name": "In Progress"}}
+            "rich_text": lambda x: [{"text": {"content": x}}],
+            "status": lambda x:{"name": x}
         }
         self.constants = ["formula"]
 
@@ -68,45 +68,55 @@ class Notion(object):
     def reads(self):
         url = f"https://api.notion.com/v1/databases/{self.database_id}/query"
         self.origin = requests.post(url, headers=self.headers).json()
+        while self.origin['has_more']:
+            payload = {"page_size": 100}
+            payload["start_cursor"] = self.origin['next_cursor']
+            r = requests.post(url, headers=self.headers, json=payload).json()
+            self.origin['results'] += r['results']
+            self.origin['has_more'] = r['has_more']
+            time.sleep(0.1)
+        self._load_to_pandas()
     
-    def write(self, where_notion_id, set, to):
+    def write(self, where_notion_id, SET, TO):
+        #ToDo: datachecker, when assign number it can't be string
         url = f"https://api.notion.com/v1/pages/{where_notion_id}"
-        data_type = self.schemas[set]
+        data_type = self.schemas[SET]
         if data_type in self.constants:
-            print(f"You suppose not to modify the data_type {self.constants},\n  you are modifying {set} TO {to}. SKIPT.")
+            print(f"You suppose not to modify the data_type {self.constants},\n  you are modifying {SET} TO {TO}. SKIPT.")
             return
         try:
-            data = { "properties": { set: {data_type: self.mutator[data_type](to)} } }
+            data = { "properties": { SET: {data_type: self.mutator[data_type](TO)} } }
         except KeyError:
-            print(f"Framework doesn't support update data_type {data_type}.\n  you are modifying {set} TO {to}. SKIPT.")
-            return
+            raise UserWarning(f"Framework doesn't support update data_type {data_type}.\n  you are modifying {SET} TO {TO}. SKIPT.")
         time.sleep(0.1)
         return requests.patch(url, headers=self.headers, data=json.dumps(data))
 
     def writes(self, with_reference_table=True):
-        diff =  self.df.compare(self.merged_df[self.df.columns])
+        diff =  self._df.compare(self.merged_df[self._df.columns])
         changes = []
         if not diff.empty:
             for col in diff.columns.levels[0]:
                 for idx in diff.index:
                     if pd.notna(diff.at[idx, (col, 'self')]) or pd.notna(diff.at[idx, (col, 'other')]):
                         changes.append({
-                            "notion_id": self.df.at[idx, "notion_id"],
+                            "notion_id": self._df.at[idx, "notion_id"],
                             "column": col,
                             "new_value": diff.at[idx, (col, 'self')],
                             "old_value": diff.at[idx, (col, 'other')]
                         })
             for change in changes:
+                if pd.isna(change['new_value']):
+                    change['new_value'] = None 
                 r = self.write(where_notion_id = change['notion_id'], 
-                           set = change['column'],
-                           to = change['new_value'])
-                if r:
+                           SET = change['column'],
+                           TO = change['new_value'])
+                if hasattr(r, 'status_code'):
                     print(f"<{r.status_code}>: notion_id {change['notion_id']}, SET {change['column']} FROM {change['old_value']} TO {change['new_value']}")
                     if r.status_code != 200:
-                        print(r.content)
+                        print(r.json()['message'])
         else:
             print(f"No update for table:{self.table_name}")
-        self.merged_df.update(self.df)
+        self.merged_df.update(self._df)
         if with_reference_table:
             self.write_reference_tables()
 
@@ -123,7 +133,10 @@ class Notion(object):
                 table.writes()
 
     def update(self, WHERE, IS, SET, TO):
-        self.df.loc[self.df[WHERE] == IS, SET] = TO
+        self.df.loc[self._df[WHERE] == IS, SET] = TO
+
+    def update_where_index(self, IS, SET, TO):
+        self.df.loc[IS, SET] = TO
 
 
 class Table(Notion):
@@ -135,8 +148,20 @@ class Table(Notion):
         self.database_id = database_id
         self.schemas = {}
         self.relations = relations
-        self.reads()
-        self.load_to_pandas()
+        self._df = None
+        self._merged_df = None
+    
+    @property
+    def df(self):
+        if self._df is None:
+            self.reads()
+        return self._df
+    
+    @property
+    def merged_df(self):
+        if self._merged_df is None:
+            self.df
+        return self._merged_df
 
     def mapping_relations(self):
         relations = {column:[] for column,type in self.schemas.items() if type == "relation"}
@@ -145,7 +170,7 @@ class Table(Notion):
                 relations[self.accessor[type](column)] += [column]
         return relations
     
-    def load_to_pandas(self):
+    def _load_to_pandas(self):
         df = []
         for d in self.origin["results"]:
             tmp = {}
@@ -164,11 +189,11 @@ class Table(Notion):
                 except KeyError as e:
                     print(f"Framework doesn't support data type {t} yet. Skip loading it.")
             df.append(tmp)
-        self.df = pd.DataFrame(df)
+        self._df = pd.DataFrame(df)
         
         # clean empty lines
         defaults = [i for i in self.schemas.values() if i in self.columns_with_default_value]+["notion_id"]
-        self.df = self.df[~(self.df.isna().sum(axis=1)==len(self.df.columns)-len(defaults))]
+        self._df = self._df[~(self._df.isna().sum(axis=1)==len(self._df.columns)-len(defaults))]
         columns = []
         if self.relations:
             relations = self.mapping_relations()
@@ -176,15 +201,15 @@ class Table(Notion):
                 ref_df = self.relations[relation]["from_table"]
                 relation_column = self.relations[relation]["lookup_column"]
                 columns += [f'{relation}|{i}' for i in ["notion_id",relation_column]+rollups]
-                self.df = self.df.merge(ref_df.merged_df.add_prefix(f'{relation}|'), 
+                self._df = self._df.merge(ref_df.merged_df.add_prefix(f'{relation}|'), 
                     left_on = relation,
                     right_on= f'{relation}|notion_id',
                     how='left')
-        self.df = self.df.set_index('notion_id', drop=False)
-        self.merged_df = self.df.copy()
+        self._df = self._df.set_index('notion_id', drop=False)
+        self._merged_df = self._df.copy()
         if columns:
-            columns = [i for i in self.merged_df.columns 
-                       if "|" not in i 
-                       or (i in columns and "|notion_id" not in i)]
-            self.df = self.merged_df[columns]
+            columns = [i for i in self._merged_df.columns 
+                    if ("|" not in i or (i in columns and "|notion_id" not in i))
+                    and i not in relations]
+            self._df = self._merged_df[columns]
 
