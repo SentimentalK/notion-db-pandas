@@ -30,7 +30,10 @@ class Notion(object):
             "select": lambda x: x["name"] if x else None,
             "status": lambda x: x["name"] if x else None,
             "rollup": lambda x: self.find_rollup(x),
-            "formula": lambda x: self.find_formula(x)
+            "formula": lambda x: self.find_formula(x),
+            "email": lambda x: x if x else None,
+            "phone_number": lambda x: x if x else None,
+
         }
         self.mutator = {
             "number": lambda x:x ,
@@ -62,7 +65,10 @@ class Notion(object):
     def find_rollup(self, column):
         if column not in self.relations:
             raise ValueError(f"rollup column \"{column}\" not defind in Table relations.")
-        related = [column for column in self.relations if id(self.relations[column]["from_table"]) == id(self.relations[column]["from_table"])]
+        relations = [i for i,v in self.schemas.items() if v == 'relation']
+        related = [i for i in relations if id(self.relations[i]["from_table"]) == id(self.relations[column]["from_table"])]
+        if not related:
+            raise ValueError(f"check refered table for column {column}. it is probably wrong.")
         return related[0]
 
     def reads(self):
@@ -92,7 +98,8 @@ class Notion(object):
         return requests.patch(url, headers=self.headers, data=json.dumps(data))
 
     def writes(self, with_reference_table=True):
-        diff =  self._df.compare(self.merged_df[self._df.columns])
+        columns = [i for i in self._df.columns if "|" not in i]
+        diff =  self._df[columns].compare(self.merged_df[columns])
         changes = []
         if not diff.empty:
             for col in diff.columns.levels[0]:
@@ -116,7 +123,7 @@ class Notion(object):
                         print(r.json()['message'])
         else:
             print(f"No update for table:{self.table_name}")
-        self.merged_df.update(self._df)
+        self.merged_df.update(self.df)
         if with_reference_table:
             self.write_reference_tables()
 
@@ -128,6 +135,7 @@ class Notion(object):
                 table = self.relations[relation]["from_table"]
                 columns = [i for i in self.merged_df.columns if re.match(rf'^{relation}\|',i)]
                 temp = self.merged_df[columns].copy()
+                temp.set_index(f'{relation}|notion_id', drop=False, inplace=True)
                 temp.columns = temp.columns.str.removeprefix(f"{relation}|")
                 table.df.update(temp)
                 table.writes()
@@ -194,22 +202,22 @@ class Table(Notion):
         # clean empty lines
         defaults = [i for i in self.schemas.values() if i in self.columns_with_default_value]+["notion_id"]
         self._df = self._df[~(self._df.isna().sum(axis=1)==len(self._df.columns)-len(defaults))]
-        columns = []
+
         if self.relations:
             relations = self.mapping_relations()
             for relation,rollups in relations.items():
                 ref_df = self.relations[relation]["from_table"]
                 relation_column = self.relations[relation]["lookup_column"]
-                columns += [f'{relation}|{i}' for i in ["notion_id",relation_column]+rollups]
                 self._df = self._df.merge(ref_df.merged_df.add_prefix(f'{relation}|'), 
                     left_on = relation,
                     right_on= f'{relation}|notion_id',
                     how='left')
         self._df = self._df.set_index('notion_id', drop=False)
         self._merged_df = self._df.copy()
-        if columns:
-            columns = [i for i in self._merged_df.columns 
-                    if ("|" not in i or (i in columns and "|notion_id" not in i))
-                    and i not in relations]
+        #ToDo: alert user when their relation not same with the data on notion.
+        if self.relations:
+            columns = [f"{relation}|{self.relations[i]["lookup_column"]}" for relation,rollups in self.mapping_relations().items() for i in rollups] \
+                 +[f"{relation}|{self.relations[relation]["lookup_column"]}" for relation in self.mapping_relations()]\
+                 +[i for i in self._merged_df.columns if "|" not in i and i not in [item for key, values in relations.items() for item in [key] + values]]
             self._df = self._merged_df[columns]
 
