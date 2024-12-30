@@ -5,9 +5,13 @@ import json
 import requests
 import pandas as pd
 from itertools import chain
+from contextlib import suppress
+from pathlib import Path
 
-if os.path.exists("token"):
-    with open("token") as f:
+current_dir = Path(__file__).parent
+token_file = current_dir / "token"
+if os.path.exists(token_file):
+    with open(token_file) as f:
         os.environ["NOTION_TOKEN"] = f.read().strip()
 
 
@@ -58,7 +62,7 @@ class Notion(object):
     def find_formula(self, data):
         supported = ['number','string']
         if data['type'] not in supported:
-            print(f'data formula - {data['type']} not supported. returning None')
+            print(f"data formula - {data['type']} not supported. returning None")
             return None
         return data[data['type']]
     
@@ -74,14 +78,17 @@ class Notion(object):
     def reads(self):
         url = f"https://api.notion.com/v1/databases/{self.database_id}/query"
         self.origin = requests.post(url, headers=self.headers).json()
+        print(f'fetching data for {self.table_name}...')
         while self.origin['has_more']:
+            print('has more data, payload limit 100 rows.')
             payload = {"page_size": 100}
             payload["start_cursor"] = self.origin['next_cursor']
             r = requests.post(url, headers=self.headers, json=payload).json()
             self.origin['results'] += r['results']
             self.origin['has_more'] = r['has_more']
+            self.origin['next_cursor'] = r['next_cursor']
             time.sleep(0.1)
-        self._load_to_pandas()
+        print(f"fetched {len(self.origin['results'])} rows")
     
     def write(self, where_notion_id, SET, TO):
         #ToDo: datachecker, when assign number it can't be string
@@ -149,7 +156,7 @@ class Notion(object):
 
 class Table(Notion):
 
-    def __init__(self, database_id, relations=None):
+    def __init__(self, database_id, relations=None, cache=False):
         super().__init__()
         self.table_name = database_id[-8:]
         self.columns_with_default_value = ["notion_id", "unique_id", "status"]
@@ -158,7 +165,9 @@ class Table(Notion):
         self.relations = relations
         self._df = None
         self._merged_df = None
-    
+        self._load(cache)
+            
+
     @property
     def df(self):
         if self._df is None:
@@ -178,6 +187,41 @@ class Table(Notion):
                 relations[self.accessor[type](column)] += [column]
         return relations
     
+    def _load(self, cache):
+        self.cashes = self._setup_cache_paths()
+        if cache:
+            self._read_caches()
+        else:
+            self._clear_cashes()
+    
+    def _clear_caches(self):
+        for file in self.cashes:
+            with suppress(FileNotFoundError):
+                os.remove(file)
+
+    def _setup_cache_paths(self):
+        cache_dir = current_dir / "__dfcache__"
+        cache_dir.mkdir(exist_ok=True)
+        return [
+            cache_dir / f"{self.table_name}_df.pkl",
+            cache_dir / f"{self.table_name}_mdf.pkl"
+        ]
+    
+    def _read_caches(self):
+        if self.cashes[0].exists():
+            print(f'{self.table_name}: data load from cache.')
+            for path in self.cashes:
+                setattr(self,f"_{path.stem.split('_')[-1]}", pd.read_pickle(path))
+
+    def _write_caches(self):
+        print(f'{self.table_name}: data write to cache.')
+        self._df.to_pickle(self.cashes[0])
+        self._merged_df.to_pickle(self.cashes[1])
+
+    def reads(self):
+        super().reads()
+        self._load_to_pandas()
+
     def _load_to_pandas(self):
         df = []
         for d in self.origin["results"]:
@@ -216,8 +260,9 @@ class Table(Notion):
         self._merged_df = self._df.copy()
         #ToDo: alert user when their relation not same with the data on notion.
         if self.relations:
-            columns = [f"{relation}|{self.relations[i]["lookup_column"]}" for relation,rollups in self.mapping_relations().items() for i in rollups] \
-                 +[f"{relation}|{self.relations[relation]["lookup_column"]}" for relation in self.mapping_relations()]\
+            columns = [f"{relation}|{self.relations[i]['lookup_column']}" for relation,rollups in self.mapping_relations().items() for i in rollups] \
+                 +[f"{relation}|{self.relations[relation]['lookup_column']}" for relation in self.mapping_relations()]\
                  +[i for i in self._merged_df.columns if "|" not in i and i not in [item for key, values in relations.items() for item in [key] + values]]
             self._df = self._merged_df[columns]
+        self._write_caches()
 
